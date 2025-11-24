@@ -63,6 +63,7 @@
 #define ID_BTN_BROWSE_WORKDIR 2011
 #define ID_CHECK_AUTOSTART 2012
 #define ID_CHECK_HIDECONSOLE 2013
+#define ID_LABEL_PYTHON 2014
 
 // Global Variables
 HINSTANCE hInst;
@@ -662,7 +663,8 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateEdit(ID_EDIT_SCRIPT, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].script_path) : L"", 2);
             CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, x + labelW + editW + 5, y + 2 * (h + gap), 30, h, hwnd, (HMENU)ID_BTN_BROWSE_SCRIPT, hInst, NULL);
 
-            CreateLabel(L"Python路径:", 3);
+            // Python路径标签使用ID，以便控制显示/隐藏
+            CreateWindowW(L"STATIC", L"Python路径:", WS_CHILD | WS_VISIBLE, x, y + 3 * (h + gap), labelW, h, hwnd, (HMENU)ID_LABEL_PYTHON, hInst, NULL);
             CreateEdit(ID_EDIT_PYTHON, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].python_path) : L"", 3);
             CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, x + labelW + editW + 5, y + 3 * (h + gap), 30, h, hwnd, (HMENU)ID_BTN_BROWSE_PYTHON, hInst, NULL);
 
@@ -688,10 +690,32 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return TRUE;
             }, (LPARAM)hFont);
 
+            // 根据初始类型设置Python路径控件的显示状态
+            bool isPython = (currentType == L"python");
+            ShowWindow(GetDlgItem(hwnd, ID_LABEL_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+            ShowWindow(GetDlgItem(hwnd, ID_EDIT_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+            ShowWindow(GetDlgItem(hwnd, ID_BTN_BROWSE_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+
             break;
         }
         case WM_COMMAND: {
             int id = LOWORD(wParam);
+            int code = HIWORD(wParam);
+
+            if (id == ID_COMBO_TYPE && code == CBN_SELCHANGE) {
+                HWND hCombo = (HWND)lParam;
+                int idx = SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+                if (idx != CB_ERR) {
+                    wchar_t buffer[256];
+                    SendMessage(hCombo, CB_GETLBTEXT, idx, (LPARAM)buffer);
+                    bool isPython = (wcscmp(buffer, L"python") == 0);
+                    
+                    ShowWindow(GetDlgItem(hwnd, ID_LABEL_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(hwnd, ID_EDIT_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(hwnd, ID_BTN_BROWSE_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+                }
+            }
+
             if (id == ID_BTN_OK) {
                 wchar_t buffer[MAX_PATH];
                 
@@ -1235,26 +1259,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HMENU hSysMenu = GetSystemMenu(hwnd, FALSE);
             AppendMenuW(hSysMenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(hSysMenu, MF_STRING, IDM_ABOUT, L"关于 (&A)...");
-
-            break;
-        }
-        case WM_SYSCOMMAND:
-            if ((wParam & 0xFFF0) == SC_MINIMIZE) {
-                // 检查是否是用户主动点击最小化按钮
-                // 如果窗口已经是前台窗口且可见，说明是点击任务栏图标触发的
-                // 此时我们不执行最小化，而是确保窗口在最前台
-                HWND hForeground = GetForegroundWindow();
-                if (hForeground == hwnd && IsWindowVisible(hwnd)) {
-                    // 窗口已经是前台且可见，将其置顶
-                    SetForegroundWindow(hwnd);
-                    BringWindowToTop(hwnd);
-                    SetActiveWindow(hwnd);
-                    return 0; // 阻止最小化
-                }
-                // 否则执行最小化到托盘
-                ShowWindow(hwnd, SW_HIDE);
-                ShowTrayIcon();
-                isMinimizedToTray = true;
                 return 0;
             }
             if ((wParam & 0xFFF0) == IDM_ABOUT) {
