@@ -6,7 +6,8 @@
 
 *   **多类型支持**：支持管理 Python 脚本、Batch 批处理文件 (.bat) 和普通可执行文件 (.exe)。
 *   **图形化管理**：提供直观的 GUI 界面，用于添加、编辑、删除、启动和停止服务。
-*   **实时状态监控**：显示服务的运行状态、PID、类型、自启动状态、控制台显示状态和运行时间。
+*   **实时状态监控**：显示服务的运行状态、PID、占用端口、类型、自启动状态、控制台显示状态和运行时间。
+    *   **端口检测**：自动检测服务及其子进程占用的 TCP/UDP 端口。
 *   **控制台管理**：支持隐藏服务的控制台窗口，让服务在后台静默运行。
 *   **日志查看**：支持查看每个服务的标准输出和错误日志。
 *   **完整的中文支持**：
@@ -34,6 +35,7 @@
     *   **隐藏控制台**：勾选此项，服务运行时不会显示控制台窗口。
 *   **编辑/删除**：右键点击列表中的服务，或选中后点击底部按钮进行操作。
 *   **启动/停止**：在列表中右键点击服务进行控制，或使用底部按钮批量操作。
+*   **最小化到托盘**：点击底部 "到托盘" 按钮，程序将隐藏并最小化到系统托盘，保持后台运行。
 
 ### 3. 系统服务模式（推荐）
 若需要服务开机自启且在后台长期运行：
@@ -61,7 +63,7 @@
 windres resource.rc -o resource.o
 
 # 2. 编译主程序
-g++ service_manager_gui.cpp resource.o -o service_manager_gui.exe -mwindows -lcomctl32 -lole32 -static-libgcc -static-libstdc++ -static
+g++ service_manager.cpp resource.o -o service_manager.exe -mwindows -lcomctl32 -lws2_32 -liphlpapi -static
 ```
 
 ## 配置文件
@@ -78,4 +80,3 @@ g++ service_manager_gui.cpp resource.o -o service_manager_gui.exe -mwindows -lco
 
 ## 作者
 项目地址：[https://github.com/git-howard](https://github.com/git-howard)
-
