@@ -1013,8 +1013,15 @@ void ShowAboutDialog(HWND hParent) {
         classRegistered = true;
     }
 
+    RECT rcOwner;
+    GetWindowRect(hParent, &rcOwner);
+    int dlgWidth = 340;
+    int dlgHeight = 200;
+    int x = rcOwner.left + (rcOwner.right - rcOwner.left - dlgWidth) / 2;
+    int y = rcOwner.top + (rcOwner.bottom - rcOwner.top - dlgHeight) / 2;
+
     HWND hDialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"AboutDialogClass", L"关于", WS_VISIBLE | WS_SYSMENU | WS_CAPTION, 
-        CW_USEDEFAULT, CW_USEDEFAULT, 340, 200, hParent, NULL, hInst, NULL);
+        x, y, dlgWidth, dlgHeight, hParent, NULL, hInst, NULL);
         
     EnableWindow(hParent, FALSE);
     MSG msg;
