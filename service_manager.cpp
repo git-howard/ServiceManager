@@ -11,6 +11,8 @@
 #include <winsvc.h>
 #include <tlhelp32.h>
 #include <commctrl.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -24,6 +26,22 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "Msimg32.lib")
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_DEFAULT
+#define DWMWCP_DEFAULT 0
+#define DWMWCP_DONOTROUND 1
+#define DWMWCP_ROUND 2
+#define DWMWCP_ROUNDSMALL 3
+#endif
 
 // Control IDs
 #define ID_LISTVIEW 1001
@@ -41,6 +59,7 @@
 #define ID_MENU_EDIT 1013
 #define ID_MENU_DEL 1014
 #define ID_MENU_LOG 1015
+#define ID_MENU_RESTART 1023
 #define ID_TRAY_ICON 1016
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1017
@@ -51,6 +70,12 @@
 #define ID_BTN_ABOUT 1022
 #define IDM_ABOUT 2000
 #define ID_LINK_ABOUT 2001
+#define ID_BTN_SYSTEM_SERVICE 2022
+#define ID_MENU_SYS_INSTALL_START 2023
+#define ID_MENU_SYS_STOP_DELETE 2024
+#define ID_MENU_SYS_START 2025
+#define ID_MENU_SYS_STOP 2026
+#define ID_MENU_SYS_RESTART 2027
 
 // Dialog Control IDs
 
@@ -93,6 +118,14 @@ std::string WideToUtf8(const std::wstring& wstr) {
     std::string strTo(size_needed, 0);
     WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
     return strTo;
+}
+
+// Enable modern look: dark titlebar and rounded corners
+void EnableModernWindow(HWND hwnd) {
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    int corner = DWMWCP_ROUND;
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
 }
 
 // Service Structure
@@ -1081,7 +1114,18 @@ LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-void ShowLogWindow(HWND hParent, const std::string& serviceName) {
+std::string ReadFileRawWide(const std::wstring& wPath) {
+    HANDLE hFile = CreateFileW(wPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+    std::string out;
+    char buffer[4096];
+    DWORD read = 0;
+    while (ReadFile(hFile, buffer, sizeof(buffer), &read, NULL) && read > 0) out.append(buffer, buffer + read);
+    CloseHandle(hFile);
+    return out;
+}
+
+void ShowLogWindow(HWND hParent, const Service& svc) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW wc = {0};
@@ -1094,7 +1138,7 @@ void ShowLogWindow(HWND hParent, const std::string& serviceName) {
         registered = true;
     }
 
-    std::wstring title = L"日志 - " + Utf8ToWide(serviceName);
+    std::wstring title = L"日志 - " + Utf8ToWide(svc.name);
     HWND hLogWnd = CreateWindowW(L"LogWindow", title.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600, hParent, NULL, hInst, NULL);
 
@@ -1103,17 +1147,39 @@ void ShowLogWindow(HWND hParent, const std::string& serviceName) {
     SendMessage(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
     // Set max text limit
     SendMessage(hEdit, EM_SETLIMITTEXT, 0, 0); 
-
     std::string base = GetBasePath();
-    std::string logPath = base + "\\logs\\" + serviceName + ".log";
-    std::ifstream f(logPath);
+    std::vector<std::string> candidates;
+    candidates.push_back(base + "\\logs\\" + svc.name + ".log");
+    std::string workdir = svc.work_dir.empty() ? std::string("") : g_manager.resolve_path(svc.work_dir);
+    if (!workdir.empty()) {
+        candidates.push_back(workdir + "\\logs\\" + svc.name + ".log");
+        candidates.push_back(workdir + "\\" + svc.name + ".log");
+        // script dir
+        std::string script = g_manager.resolve_path(svc.script_path);
+        size_t pos = script.find_last_of("\\/");
+        if (pos != std::string::npos) {
+            std::string sdir = script.substr(0, pos);
+            candidates.push_back(sdir + "\\logs\\" + svc.name + ".log");
+        }
+    }
+
     std::string content;
-    if (f.is_open()) {
-        std::stringstream buffer;
-        buffer << f.rdbuf();
-        content = buffer.str();
-    } else {
-        content = "无法找到日志文件: " + logPath + "\n(服务可能从未运行过)";
+    std::wstring usedPathW;
+    for (const auto& p : candidates) {
+        std::wstring wp = Utf8ToWide(p);
+        DWORD attrs = GetFileAttributesW(wp.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            content = ReadFileRawWide(wp);
+            usedPathW = wp;
+            break;
+        }
+    }
+    if (content.empty()) {
+        std::stringstream ss;
+        ss << "无法找到日志文件于以下位置:\n";
+        for (auto& p : candidates) ss << p << "\n";
+        ss << "\n(服务可能从未运行过，或日志路径不在默认位置)";
+        content = ss.str();
     }
     
     std::wstring wContent = Utf8ToWide(content);
@@ -1283,6 +1349,66 @@ void UninstallService() {
     }
 }
 
+void InstallAndStartService() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string binPath = std::string(path) + " --service";
+    std::string cmdCreate = "create ServiceManager binPath= \"" + binPath + "\" start= auto DisplayName= \"Service Manager Tool\"";
+    SHELLEXECUTEINFOA sei1 = { sizeof(sei1) };
+    sei1.lpVerb = "runas";
+    sei1.lpFile = "sc";
+    sei1.lpParameters = cmdCreate.c_str();
+    sei1.nShow = SW_HIDE;
+    ShellExecuteExA(&sei1);
+
+    SHELLEXECUTEINFOA sei2 = { sizeof(sei2) };
+    sei2.lpVerb = "runas";
+    sei2.lpFile = "sc";
+    sei2.lpParameters = "start ServiceManager";
+    sei2.nShow = SW_HIDE;
+    ShellExecuteExA(&sei2);
+}
+
+void StopAndDeleteService() {
+    SHELLEXECUTEINFOA sei1 = { sizeof(sei1) };
+    sei1.lpVerb = "runas";
+    sei1.lpFile = "sc";
+    sei1.lpParameters = "stop ServiceManager";
+    sei1.nShow = SW_HIDE;
+    ShellExecuteExA(&sei1);
+
+    SHELLEXECUTEINFOA sei2 = { sizeof(sei2) };
+    sei2.lpVerb = "runas";
+    sei2.lpFile = "sc";
+    sei2.lpParameters = "delete ServiceManager";
+    sei2.nShow = SW_HIDE;
+    ShellExecuteExA(&sei2);
+}
+
+void StartSystemService() {
+    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+    sei.lpVerb = "runas";
+    sei.lpFile = "sc";
+    sei.lpParameters = "start ServiceManager";
+    sei.nShow = SW_HIDE;
+    ShellExecuteExA(&sei);
+}
+
+void StopSystemService() {
+    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+    sei.lpVerb = "runas";
+    sei.lpFile = "sc";
+    sei.lpParameters = "stop ServiceManager";
+    sei.nShow = SW_HIDE;
+    ShellExecuteExA(&sei);
+}
+
+void RestartSystemService() {
+    StopSystemService();
+    Sleep(800);
+    StartSystemService();
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -1297,6 +1423,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
             }
 
+            EnableModernWindow(hwnd);
             InitTrayIcon(hwnd);
 
             // Create ListView
@@ -1305,6 +1432,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 10, 10, 760, 400, hwnd, (HMENU)ID_LISTVIEW, hInst, NULL);
             
             ListView_SetExtendedListViewStyle(hListView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            SetWindowTheme(hListView, L"Explorer", NULL);
+            // 默认文本颜色设为高对比深色
+            SendMessageW(hListView, LVM_SETTEXTCOLOR, 0, (LPARAM)RGB(32,32,32));
+            SendMessageW(hListView, LVM_SETBKCOLOR, 0, (LPARAM)RGB(255,255,255));
             
             LVCOLUMNW lvc = {0};
             lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
@@ -1327,7 +1458,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int x = 10;
 
             auto CreateBtn = [&](int id, const wchar_t* text) {
-                HWND hBtn = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE, x, btnY, btnW, btnH, hwnd, (HMENU)(UINT_PTR)id, hInst, NULL);
+                HWND hBtn = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x, btnY, btnW, btnH, hwnd, (HMENU)(UINT_PTR)id, hInst, NULL);
                 SendMessage(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
                 x += btnW + gap;
             };
@@ -1340,11 +1471,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateBtn(ID_BTN_STARTALL, L"全部启动");
             CreateBtn(ID_BTN_STOPALL, L"全部停止");
             CreateBtn(ID_BTN_TRAY, L"到托盘");
-            CreateBtn(ID_BTN_INSTALL_SVC, L"注册服务");
-            CreateBtn(ID_BTN_UNINSTALL_SVC, L"注销服务");
+            CreateBtn(ID_BTN_SYSTEM_SERVICE, L"系统服务");
 
             // ? Button
-            HWND hBtnAbout = CreateWindowW(L"BUTTON", L"?", WS_CHILD | WS_VISIBLE, x, btnY, 30, btnH, hwnd, (HMENU)ID_BTN_ABOUT, hInst, NULL);
+            HWND hBtnAbout = CreateWindowW(L"BUTTON", L"?", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x, btnY, 30, btnH, hwnd, (HMENU)ID_BTN_ABOUT, hInst, NULL);
             SendMessage(hBtnAbout, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // Author Link
@@ -1420,6 +1550,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case WM_NOTIFY: {
             LPNMHDR lpnm = (LPNMHDR)lParam;
+            if (lpnm->idFrom == ID_LISTVIEW && lpnm->code == NM_CUSTOMDRAW) {
+                LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
+                switch (cd->nmcd.dwDrawStage) {
+                case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
+                case CDDS_ITEMPREPAINT: return CDRF_NOTIFYSUBITEMDRAW;
+                case CDDS_SUBITEM | CDDS_ITEMPREPAINT: {
+                    auto isHighContrast = [](){
+                        HIGHCONTRASTW hc{sizeof(hc)};
+                        return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) && (hc.dwFlags & HCF_HIGHCONTRASTON);
+                    }();
+                    if (cd->nmcd.uItemState & CDIS_SELECTED) {
+                        RECT rc; ListView_GetSubItemRect((HWND)cd->nmcd.hdr.hwndFrom, (int)cd->nmcd.dwItemSpec, cd->iSubItem, LVIR_BOUNDS, &rc);
+                        if (isHighContrast) {
+                            HBRUSH br = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+                            FillRect(cd->nmcd.hdc, &rc, br);
+                            DeleteObject(br);
+                            cd->clrText = GetSysColor(COLOR_HIGHLIGHTTEXT);
+                            cd->clrTextBk = CLR_NONE;
+                            return CDRF_NEWFONT;
+                        } else {
+                            TRIVERTEX vx[2] = { {rc.left,rc.top,0x04F8,0x09FD,0x0FFE,0x0000},
+                                                {rc.right,rc.bottom,0x03E6,0x08CB,0x0FFE,0x0000} };
+                            GRADIENT_RECT gr = {0,1};
+                            GradientFill(cd->nmcd.hdc, vx, 2, &gr, 1, GRADIENT_FILL_RECT_H);
+                            cd->clrText = RGB(255,255,255);
+                            cd->clrTextBk = CLR_NONE;
+                            return CDRF_NEWFONT;
+                        }
+                    } else {
+                        if ((cd->nmcd.dwItemSpec % 2) == 1) {
+                            cd->clrTextBk = isHighContrast ? GetSysColor(COLOR_WINDOW) : RGB(245,245,245);
+                        } else {
+                            cd->clrTextBk = isHighContrast ? GetSysColor(COLOR_WINDOW) : RGB(255,255,255);
+                        }
+                        cd->clrText = isHighContrast ? GetSysColor(COLOR_WINDOWTEXT) : RGB(32,32,32);
+                        return CDRF_NEWFONT;
+                    }
+                    break;
+                }
+                }
+            }
             if (lpnm->idFrom == ID_LISTVIEW && lpnm->code == NM_RCLICK) {
                 LPNMITEMACTIVATE lpnmitem = (LPNMITEMACTIVATE)lParam;
                 if (lpnmitem->iItem != -1) {
@@ -1433,6 +1604,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     
                     AppendMenuW(hMenu, MF_STRING | (running ? MF_GRAYED : 0), ID_MENU_START, L"启动");
                     AppendMenuW(hMenu, MF_STRING | (!running ? MF_GRAYED : 0), ID_MENU_STOP, L"停止");
+                    AppendMenuW(hMenu, MF_STRING | (!running ? MF_GRAYED : 0), ID_MENU_RESTART, L"重启");
                     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
                     AppendMenuW(hMenu, MF_STRING, ID_MENU_LOG, L"查看日志");
                     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
@@ -1528,15 +1700,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     UpdateListView();
                     break;
                 case ID_BTN_TRAY:
-                    ShowWindow(hwnd, SW_HIDE);
+                    AnimateWindow(hwnd, 150, AW_BLEND | AW_HIDE);
                     ShowTrayIcon();
                     isMinimizedToTray = true;
                     break;
-                case ID_BTN_INSTALL_SVC:
-                    InstallService();
+                case ID_BTN_SYSTEM_SERVICE: {
+                    HWND hBtn = GetDlgItem(hwnd, ID_BTN_SYSTEM_SERVICE);
+                    RECT rc; GetWindowRect(hBtn, &rc);
+                    HMENU hMenu = CreatePopupMenu();
+                    AppendMenuW(hMenu, MF_STRING, ID_MENU_SYS_INSTALL_START, L"注册并启动服务");
+                    AppendMenuW(hMenu, MF_STRING, ID_MENU_SYS_STOP_DELETE, L"停止并注销服务");
+                    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+                    AppendMenuW(hMenu, MF_STRING, ID_MENU_SYS_START, L"启动服务");
+                    AppendMenuW(hMenu, MF_STRING, ID_MENU_SYS_STOP, L"停止服务");
+                    AppendMenuW(hMenu, MF_STRING, ID_MENU_SYS_RESTART, L"重启服务");
+                    TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN, rc.left, rc.bottom, 0, hwnd, NULL);
+                    DestroyMenu(hMenu);
                     break;
-                case ID_BTN_UNINSTALL_SVC:
-                    UninstallService();
+                }
+                case ID_MENU_SYS_INSTALL_START:
+                    InstallAndStartService();
+                    break;
+                case ID_MENU_SYS_STOP_DELETE:
+                    StopAndDeleteService();
+                    break;
+                case ID_MENU_SYS_START:
+                    StartSystemService();
+                    break;
+                case ID_MENU_SYS_STOP:
+                    StopSystemService();
+                    break;
+                case ID_MENU_SYS_RESTART:
+                    RestartSystemService();
                     break;
                 case ID_MENU_START:
                     SendMessage(hwnd, WM_COMMAND, ID_BTN_START, 0);
@@ -1544,10 +1739,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_MENU_STOP:
                     SendMessage(hwnd, WM_COMMAND, ID_BTN_STOP, 0);
                     break;
+                case ID_MENU_RESTART: {
+                    int sel = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
+                    if (sel != -1) {
+                        if (g_manager.services[sel].status == "运行中") {
+                            g_manager.stop_service(sel);
+                        }
+                        g_manager.start_service(sel);
+                        UpdateListView();
+                    }
+                    break;
+                }
                 case ID_MENU_LOG: {
                     int sel = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
                     if (sel != -1) {
-                        ShowLogWindow(hwnd, g_manager.services[sel].name);
+                        ShowLogWindow(hwnd, g_manager.services[sel]);
                     }
                     break;
                 }
@@ -1559,7 +1765,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
                 case ID_TRAY_RESTORE:
                     ShowWindow(hwnd, SW_SHOW);
-                    ShowWindow(hwnd, SW_RESTORE);
+                    AnimateWindow(hwnd, 150, AW_BLEND);
                     RemoveTrayIcon();
                     isMinimizedToTray = false;
                     SetForegroundWindow(hwnd);
@@ -1570,6 +1776,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_BTN_ABOUT:
                     ShowAboutDialog(hwnd);
                     break;
+            }
+            break;
+        }
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* p = (DRAWITEMSTRUCT*)lParam;
+            if (p->CtlType == ODT_BUTTON) {
+                RECT rc = p->rcItem;
+                BOOL press = (p->itemState & ODS_SELECTED) != 0;
+                BOOL focus = (p->itemState & ODS_FOCUS) != 0;
+                COLORREF base = RGB(0x00,0x78,0xD4);
+                COLORREF fill = press ? RGB(0x0F,0x6C,0xBD) : base;
+                HBRUSH br = CreateSolidBrush(fill);
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x00,0x5A,0x9E));
+                HGDIOBJ oldPen = SelectObject(p->hDC, pen);
+                HGDIOBJ oldBr = SelectObject(p->hDC, br);
+                RoundRect(p->hDC, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+                SelectObject(p->hDC, oldBr); DeleteObject(br);
+                SelectObject(p->hDC, oldPen); DeleteObject(pen);
+                SetBkMode(p->hDC, TRANSPARENT);
+                SetTextColor(p->hDC, RGB(255,255,255));
+                wchar_t textBuf[128];
+                SendMessage((HWND)p->hwndItem, WM_GETTEXT, (WPARAM)128, (LPARAM)textBuf);
+                DrawTextW(p->hDC, textBuf, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                if (focus) {
+                    DrawFocusRect(p->hDC, &rc);
+                }
+                return TRUE;
             }
             break;
         }
@@ -1644,7 +1877,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     InitCommonControlsEx(&icex);
 
     // Create Font
-    hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
+    hFont = CreateFontW(16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
 
     // Register Window Class
     WNDCLASSW wc = {0};
@@ -1671,6 +1904,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!hMainWnd) return FALSE;
 
     ShowWindow(hMainWnd, nCmdShow);
+    AnimateWindow(hMainWnd, 200, AW_BLEND);
     UpdateWindow(hMainWnd);
 
     // Message Loop
