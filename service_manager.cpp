@@ -21,6 +21,10 @@
 #include <algorithm>
 #include <direct.h>
 #include <map>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <deque>
 
 // Link with comctl32.lib
 #pragma comment(lib, "comctl32.lib")
@@ -60,6 +64,8 @@
 #define ID_MENU_DEL 1014
 #define ID_MENU_LOG 1015
 #define ID_MENU_RESTART 1023
+#define ID_MENU_MOVE_UP 1024
+#define ID_MENU_MOVE_DOWN 1025
 #define ID_TRAY_ICON 1016
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1017
@@ -76,6 +82,7 @@
 #define ID_MENU_SYS_START 2025
 #define ID_MENU_SYS_STOP 2026
 #define ID_MENU_SYS_RESTART 2027
+#define WM_REQ_START_FROM_QUEUE (WM_USER + 2)
 
 // Dialog Control IDs
 
@@ -93,15 +100,28 @@
 #define ID_BTN_BROWSE_WORKDIR 2011
 #define ID_CHECK_AUTOSTART 2012
 #define ID_CHECK_HIDECONSOLE 2013
+#define ID_CHECK_AUTORESTART 2015
 #define ID_LABEL_PYTHON 2014
+#define ID_TAB_CONTROL 2016
+#define ID_LABEL_NAME 2017
+#define ID_LABEL_TYPE 2018
+#define ID_LABEL_SCRIPT 2019
+#define ID_LABEL_ARGS 2020
+#define ID_LABEL_WORKDIR 2021
+#define ID_EDIT_LOG 2028
 
 // Global Variables
 HINSTANCE hInst;
 HWND hMainWnd;
 HWND hListView;
+HWND hLogEdit = NULL;
 HFONT hFont;
 NOTIFYICONDATA nid;
 bool isMinimizedToTray = false;
+
+// Global queue for sequential startup
+std::deque<std::string> g_pendingStarts;
+std::mutex g_pendingMutex;
 
 // Utility Functions for Encoding
 std::wstring Utf8ToWide(const std::string& str) {
@@ -143,7 +163,13 @@ struct Service {
     time_t start_time = 0;
     bool auto_start = false;
     bool hide_console = true;
+    bool auto_restart = false;
     std::string ports;
+    
+    // Runtime tracking
+    bool expected_stop = true;
+    time_t crash_time = 0;
+    std::deque<time_t> restart_timestamps;
 
     std::string get_runtime() {
         if (status != "运行中" || start_time == 0) {
@@ -155,11 +181,28 @@ struct Service {
         int m = (int)((seconds - h * 3600) / 60);
         int s = (int)(seconds - h * 3600 - m * 60);
         
-        char buffer[16];
-        sprintf(buffer, "%02d:%02d:%02d", h, m, s);
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", h, m, s);
         return std::string(buffer);
     }
 };
+
+void AppendLog(const std::string& msg) {
+    if (!hLogEdit) return;
+    
+    time_t now = time(0);
+    struct tm tstruct;
+    char buf[80];
+    tstruct = *localtime(&now);
+    strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tstruct);
+    
+    std::string fullMsg = std::string(buf) + msg + "\r\n";
+    std::wstring wMsg = Utf8ToWide(fullMsg);
+    
+    int len = GetWindowTextLengthW(hLogEdit);
+    SendMessageW(hLogEdit, EM_SETSEL, len, len);
+    SendMessageW(hLogEdit, EM_REPLACESEL, FALSE, (LPARAM)wMsg.c_str());
+}
 
 // Helper to get executable directory
 std::string GetBasePath() {
@@ -368,6 +411,7 @@ public:
     std::vector<Service> services;
     std::string config_file;
     std::string global_python_path;
+    int startup_interval;
 
     ServiceManager(const std::string& cfg_file = "services_config.ini") {
         std::string base = GetBasePath();
@@ -378,6 +422,7 @@ public:
             config_file = cfg_file;
         }
         global_python_path = "python";
+        startup_interval = 1000; // Default 1000 milliseconds
     }
 
     std::string resolve_path(const std::string& path) {
@@ -497,6 +542,7 @@ public:
         std::string current_section;
         Service current_service;
         bool in_service_section = false;
+        bool found_startup_interval = false;
 
         services.clear();
 
@@ -526,6 +572,15 @@ public:
 
                     if (current_section == "global") {
                         if (key == "global_python_path") global_python_path = value;
+                        else if (key == "startup_interval") {
+                            found_startup_interval = true;
+                            try {
+                                startup_interval = std::stoi(value);
+                                if (startup_interval < 0) startup_interval = 0;
+                            } catch (...) {
+                                startup_interval = 1000;
+                            }
+                        }
                     } else if (in_service_section) {
                         if (key == "name") current_service.name = value;
                         else if (key == "script_path") current_service.script_path = value;
@@ -535,12 +590,17 @@ public:
                         else if (key == "work_dir") current_service.work_dir = value;
                         else if (key == "auto_start") current_service.auto_start = (value == "true" || value == "1");
                         else if (key == "hide_console") current_service.hide_console = (value == "true" || value == "1");
+                        else if (key == "auto_restart") current_service.auto_restart = (value == "true" || value == "1");
                     }
                 }
             }
         }
         if (in_service_section && !current_service.name.empty()) {
             services.push_back(current_service);
+        }
+        
+        if (!found_startup_interval) {
+            save_config();
         }
     }
 
@@ -550,7 +610,8 @@ public:
         if (!file.is_open()) return;
 
         file << "[global]\n";
-        file << "global_python_path = " << global_python_path << "\n\n";
+        file << "global_python_path = " << global_python_path << "\n";
+        file << "startup_interval = " << startup_interval << "\n\n";
 
         for (size_t i = 0; i < services.size(); ++i) {
             file << "[service_" << (i + 1) << "]\n";
@@ -561,15 +622,27 @@ public:
             file << "args = " << services[i].args << "\n";
             file << "work_dir = " << services[i].work_dir << "\n";
             file << "auto_start = " << (services[i].auto_start ? "true" : "false") << "\n";
-            file << "hide_console = " << (services[i].hide_console ? "true" : "false") << "\n\n";
+            file << "hide_console = " << (services[i].hide_console ? "true" : "false") << "\n";
+            file << "auto_restart = " << (services[i].auto_restart ? "true" : "false") << "\n\n";
         }
         file.close();
         NotifyServiceConfigChange();
     }
 
+    int get_service_index(const std::string& name) {
+        for (size_t i = 0; i < services.size(); ++i) {
+            if (services[i].name == name) return (int)i;
+        }
+        return -1;
+    }
+
     void start_service(int index) {
         if (index < 0 || index >= services.size()) return;
         Service& svc = services[index];
+
+        // Reset runtime tracking
+        svc.expected_stop = false;
+        svc.crash_time = 0;
 
         if (svc.status == "运行中") return;
 
@@ -642,11 +715,13 @@ public:
             svc.status = "运行中";
             svc.start_time = time(0);
             write_pid_file(svc.name, svc.pid, svc.start_time);
+            AppendLog(svc.name + " 启动成功 (PID: " + std::to_string(svc.pid) + ")");
             
             CloseHandle(pi.hThread);
             if (hLogFile != INVALID_HANDLE_VALUE) CloseHandle(hLogFile);
         } else {
             if (hLogFile != INVALID_HANDLE_VALUE) CloseHandle(hLogFile);
+            AppendLog(svc.name + " 启动失败");
             // Only show message box if we are in GUI mode (roughly check if window exists or not service)
             // But this class is shared. For now, simple check:
             if (GetConsoleWindow() || FindWindowW(L"ServiceManagerClass", NULL))
@@ -657,6 +732,9 @@ public:
     void stop_service(int index) {
         if (index < 0 || index >= services.size()) return;
         Service& svc = services[index];
+
+        svc.expected_stop = true;
+        AppendLog("正在停止服务: " + svc.name);
 
         if (svc.status != "运行中") return;
 
@@ -689,10 +767,13 @@ public:
         svc.pid = 0;
         svc.status = "已停止";
         remove_pid_file(svc.name);
+        AppendLog(svc.name + " 已停止");
     }
 
     void check_status() {
-        for (auto& svc : services) {
+        time_t now = time(0);
+        for (size_t i = 0; i < services.size(); ++i) {
+            Service& svc = services[i];
             // Try to recover state from PID file if memory state is empty
             if (svc.pid == 0) {
                 DWORD fPid;
@@ -701,6 +782,7 @@ public:
                     svc.pid = fPid;
                     svc.start_time = fTime;
                     svc.status = "运行中"; // Assume running until checked
+                    svc.expected_stop = false; // Recovered, so it should be running
                 }
             }
 
@@ -720,8 +802,6 @@ public:
                     }
                 } else {
                     // OpenProcess failed. 
-                    // If Access Denied (5), it exists but we can't open it. Assume running?
-                    // If File Not Found (2), it's gone.
                     if (GetLastError() == ERROR_ACCESS_DENIED) {
                         is_running = true;
                         svc.status = "运行中";
@@ -737,18 +817,66 @@ public:
                         svc.hProcess = NULL;
                     }
                     remove_pid_file(svc.name);
+
+                    // Abnormal exit handling: Record crash time
+                    if (!svc.expected_stop) {
+                        AppendLog(svc.name + " 异常退出");
+                        if (svc.crash_time == 0) {
+                            svc.crash_time = now;
+                        }
+                    }
                 } else {
                     svc.ports = GetServicePorts(svc.pid);
+                    // It is running, reset crash time if any
+                    svc.crash_time = 0;
                 }
-            } else {
+            } 
+            
+            // Check for restart (if stopped and not expected)
+            // This runs if pid was 0 initially OR if it became 0 above
+            if (svc.pid == 0) {
                 svc.status = "已停止";
                 svc.ports = "";
+                
+                if (!svc.expected_stop && svc.auto_restart && svc.crash_time != 0) {
+                    // Prune old restart timestamps (> 60 seconds)
+                    while (!svc.restart_timestamps.empty() && (now - svc.restart_timestamps.front() > 60)) {
+                        svc.restart_timestamps.pop_front();
+                    }
+
+                    if (svc.restart_timestamps.size() < 3) {
+                        if (difftime(now, svc.crash_time) >= 1.0) {
+                            svc.restart_timestamps.push_back(now);
+                            AppendLog(svc.name + " 尝试自动重启...");
+                            start_service((int)i);
+                        }
+                    }
+                }
             }
         }
     }
 };
 
 ServiceManager g_manager;
+
+// Worker thread for sequential startup
+void StartupThreadFunc(HWND hwnd, std::vector<std::string> names, int interval) {
+    for (const auto& name : names) {
+        // Add to queue
+        {
+            std::lock_guard<std::mutex> lock(g_pendingMutex);
+            g_pendingStarts.push_back(name);
+        }
+        
+        // Notify UI
+        PostMessage(hwnd, WM_REQ_START_FROM_QUEUE, 0, 0);
+        
+        // Sleep
+        if (interval > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+        }
+    }
+}
 
 // Dialog Logic
 struct DialogData {
@@ -762,17 +890,30 @@ DialogData g_dialogData;
 LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
+            // Create Tab Control
+            HWND hTab = CreateWindowW(WC_TABCONTROL, L"", WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE, 
+                10, 10, 465, 230, hwnd, (HMENU)ID_TAB_CONTROL, hInst, NULL);
+            SendMessage(hTab, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            TCITEMW tie;
+            tie.mask = TCIF_TEXT;
+            tie.pszText = (LPWSTR)L"常规";
+            TabCtrl_InsertItem(hTab, 0, &tie);
+            tie.pszText = (LPWSTR)L"选项";
+            TabCtrl_InsertItem(hTab, 1, &tie);
+
             // Create controls
-            int y = 20;
+            int startY = 45; // Inside/Below tab
+            int y = startY;
             int labelW = 80;
             int editW = 300;
             int btnW = 60;
             int h = 25;
             int gap = 10;
-            int x = 20;
+            int x = 25;
 
-            auto CreateLabel = [&](const wchar_t* text, int row) {
-                CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y + row * (h + gap), labelW, h, hwnd, NULL, hInst, NULL);
+            auto CreateLabel = [&](int id, const wchar_t* text, int row) {
+                CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y + row * (h + gap), labelW, h, hwnd, (HMENU)(UINT_PTR)id, hInst, NULL);
             };
             auto CreateEdit = [&](int id, const std::wstring& val, int row) {
                 HWND hEdit = CreateWindowW(L"EDIT", val.c_str(), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, x + labelW, y + row * (h + gap), editW, h, hwnd, (HMENU)(UINT_PTR)id, hInst, NULL);
@@ -780,10 +921,11 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return hEdit;
             };
 
-            CreateLabel(L"服务名称:", 0);
+            // --- Tab 0: General ---
+            CreateLabel(ID_LABEL_NAME, L"服务名称:", 0);
             CreateEdit(ID_EDIT_NAME, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].name) : L"", 0);
 
-            CreateLabel(L"服务类型:", 1);
+            CreateLabel(ID_LABEL_TYPE, L"服务类型:", 1);
             HWND hCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, x + labelW, y + 1 * (h + gap), editW, 100, hwnd, (HMENU)ID_COMBO_TYPE, hInst, NULL);
             SendMessage(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
             SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"python");
@@ -793,7 +935,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int idx = SendMessageW(hCombo, CB_FINDSTRINGEXACT, -1, (LPARAM)currentType.c_str());
             SendMessage(hCombo, CB_SETCURSEL, (idx == CB_ERR ? 0 : idx), 0);
 
-            CreateLabel(L"脚本路径:", 2);
+            CreateLabel(ID_LABEL_SCRIPT, L"脚本路径:", 2);
             CreateEdit(ID_EDIT_SCRIPT, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].script_path) : L"", 2);
             CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, x + labelW + editW + 5, y + 2 * (h + gap), 30, h, hwnd, (HMENU)ID_BTN_BROWSE_SCRIPT, hInst, NULL);
 
@@ -802,21 +944,30 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateEdit(ID_EDIT_PYTHON, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].python_path) : L"", 3);
             CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, x + labelW + editW + 5, y + 3 * (h + gap), 30, h, hwnd, (HMENU)ID_BTN_BROWSE_PYTHON, hInst, NULL);
 
-            CreateLabel(L"参数:", 4);
+            CreateLabel(ID_LABEL_ARGS, L"参数:", 4);
             CreateEdit(ID_EDIT_ARGS, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].args) : L"", 4);
 
-            CreateLabel(L"工作目录:", 5);
+            CreateLabel(ID_LABEL_WORKDIR, L"工作目录:", 5);
             CreateEdit(ID_EDIT_WORKDIR, g_dialogData.is_edit ? Utf8ToWide(g_manager.services[g_dialogData.service_index].work_dir) : L"", 5);
             CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, x + labelW + editW + 5, y + 5 * (h + gap), 30, h, hwnd, (HMENU)ID_BTN_BROWSE_WORKDIR, hInst, NULL);
 
-            CreateWindowW(L"BUTTON", L"自动启动", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x + labelW, y + 6 * (h + gap), 100, h, hwnd, (HMENU)ID_CHECK_AUTOSTART, hInst, NULL);
+            // --- Tab 1: Daemon (Restart) ---
+            // Re-use positions relative to top, but hide initially
+            CreateWindowW(L"BUTTON", L"异常退出自动重启", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x, startY, 200, h, hwnd, (HMENU)ID_CHECK_AUTORESTART, hInst, NULL);
+            SendMessage(GetDlgItem(hwnd, ID_CHECK_AUTORESTART), BM_SETCHECK, g_dialogData.is_edit && g_manager.services[g_dialogData.service_index].auto_restart ? BST_CHECKED : BST_UNCHECKED, 0);
+            ShowWindow(GetDlgItem(hwnd, ID_CHECK_AUTORESTART), SW_HIDE);
+
+            CreateWindowW(L"BUTTON", L"自动启动", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x, startY + 1 * (h + gap), 100, h, hwnd, (HMENU)ID_CHECK_AUTOSTART, hInst, NULL);
             SendMessage(GetDlgItem(hwnd, ID_CHECK_AUTOSTART), BM_SETCHECK, g_dialogData.is_edit && g_manager.services[g_dialogData.service_index].auto_start ? BST_CHECKED : BST_UNCHECKED, 0);
+            ShowWindow(GetDlgItem(hwnd, ID_CHECK_AUTOSTART), SW_HIDE);
 
-            CreateWindowW(L"BUTTON", L"隐藏控制台", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x + labelW + 120, y + 6 * (h + gap), 120, h, hwnd, (HMENU)ID_CHECK_HIDECONSOLE, hInst, NULL);
+            CreateWindowW(L"BUTTON", L"隐藏控制台", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x, startY + 2 * (h + gap), 100, h, hwnd, (HMENU)ID_CHECK_HIDECONSOLE, hInst, NULL);
             SendMessage(GetDlgItem(hwnd, ID_CHECK_HIDECONSOLE), BM_SETCHECK, g_dialogData.is_edit ? (g_manager.services[g_dialogData.service_index].hide_console ? BST_CHECKED : BST_UNCHECKED) : BST_CHECKED, 0);
+            ShowWindow(GetDlgItem(hwnd, ID_CHECK_HIDECONSOLE), SW_HIDE);
 
-            CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 150, 280, 80, 30, hwnd, (HMENU)ID_BTN_OK, hInst, NULL);
-            CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 250, 280, 80, 30, hwnd, (HMENU)ID_BTN_CANCEL, hInst, NULL);
+            // Buttons (OK/Cancel) at bottom
+            CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 150, 270, 80, 30, hwnd, (HMENU)ID_BTN_OK, hInst, NULL);
+            CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 250, 270, 80, 30, hwnd, (HMENU)ID_BTN_CANCEL, hInst, NULL);
             
             // Set font for all children
             EnumChildWindows(hwnd, [](HWND hChild, LPARAM lParam){
@@ -824,12 +975,50 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return TRUE;
             }, (LPARAM)hFont);
 
-            // 根据初始类型设置Python路径控件的显示状态
+            // Handle initial visibility for General Tab
             bool isPython = (currentType == L"python");
             ShowWindow(GetDlgItem(hwnd, ID_LABEL_PYTHON), isPython ? SW_SHOW : SW_HIDE);
             ShowWindow(GetDlgItem(hwnd, ID_EDIT_PYTHON), isPython ? SW_SHOW : SW_HIDE);
             ShowWindow(GetDlgItem(hwnd, ID_BTN_BROWSE_PYTHON), isPython ? SW_SHOW : SW_HIDE);
 
+            break;
+        }
+        case WM_NOTIFY: {
+            LPNMHDR lpnm = (LPNMHDR)lParam;
+            if (lpnm->idFrom == ID_TAB_CONTROL && lpnm->code == TCN_SELCHANGE) {
+                int curSel = TabCtrl_GetCurSel(lpnm->hwndFrom);
+                bool showGeneral = (curSel == 0);
+                bool showDaemon = (curSel == 1);
+                
+                int generalIDs[] = {
+                    ID_LABEL_NAME, ID_EDIT_NAME,
+                    ID_LABEL_TYPE, ID_COMBO_TYPE,
+                    ID_LABEL_SCRIPT, ID_EDIT_SCRIPT, ID_BTN_BROWSE_SCRIPT,
+                    ID_LABEL_ARGS, ID_EDIT_ARGS,
+                    ID_LABEL_WORKDIR, ID_EDIT_WORKDIR, ID_BTN_BROWSE_WORKDIR
+                };
+                
+                for (int id : generalIDs) ShowWindow(GetDlgItem(hwnd, id), showGeneral ? SW_SHOW : SW_HIDE);
+
+                // Python specific logic
+                if (showGeneral) {
+                    wchar_t buffer[256];
+                    GetDlgItemTextW(hwnd, ID_COMBO_TYPE, buffer, 256);
+                    bool isPython = (wcscmp(buffer, L"python") == 0);
+                    ShowWindow(GetDlgItem(hwnd, ID_LABEL_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(hwnd, ID_EDIT_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(hwnd, ID_BTN_BROWSE_PYTHON), isPython ? SW_SHOW : SW_HIDE);
+                } else {
+                    ShowWindow(GetDlgItem(hwnd, ID_LABEL_PYTHON), SW_HIDE);
+                    ShowWindow(GetDlgItem(hwnd, ID_EDIT_PYTHON), SW_HIDE);
+                    ShowWindow(GetDlgItem(hwnd, ID_BTN_BROWSE_PYTHON), SW_HIDE);
+                }
+
+                // Daemon Tab
+                ShowWindow(GetDlgItem(hwnd, ID_CHECK_AUTORESTART), showDaemon ? SW_SHOW : SW_HIDE);
+                ShowWindow(GetDlgItem(hwnd, ID_CHECK_AUTOSTART), showDaemon ? SW_SHOW : SW_HIDE);
+                ShowWindow(GetDlgItem(hwnd, ID_CHECK_HIDECONSOLE), showDaemon ? SW_SHOW : SW_HIDE);
+            }
             break;
         }
         case WM_COMMAND: {
@@ -844,6 +1033,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SendMessage(hCombo, CB_GETLBTEXT, idx, (LPARAM)buffer);
                     bool isPython = (wcscmp(buffer, L"python") == 0);
                     
+                    // Only update if we are on General tab (which we must be to click the combo)
                     ShowWindow(GetDlgItem(hwnd, ID_LABEL_PYTHON), isPython ? SW_SHOW : SW_HIDE);
                     ShowWindow(GetDlgItem(hwnd, ID_EDIT_PYTHON), isPython ? SW_SHOW : SW_HIDE);
                     ShowWindow(GetDlgItem(hwnd, ID_BTN_BROWSE_PYTHON), isPython ? SW_SHOW : SW_HIDE);
@@ -873,6 +1063,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 
                 g_dialogData.result_service.auto_start = (SendMessage(GetDlgItem(hwnd, ID_CHECK_AUTOSTART), BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_dialogData.result_service.hide_console = (SendMessage(GetDlgItem(hwnd, ID_CHECK_HIDECONSOLE), BM_GETCHECK, 0, 0) == BST_CHECKED);
+                g_dialogData.result_service.auto_restart = (SendMessage(GetDlgItem(hwnd, ID_CHECK_AUTORESTART), BM_GETCHECK, 0, 0) == BST_CHECKED);
 
                 if (g_dialogData.result_service.name.empty() || g_dialogData.result_service.script_path.empty()) {
                     MessageBoxW(hwnd, L"名称和脚本路径不能为空", L"错误", MB_OK | MB_ICONERROR);
@@ -881,14 +1072,6 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 DestroyWindow(hwnd);
             } else if (id == ID_BTN_CANCEL) {
-                // If cancelling edit, we might want to clear result to indicate no change, 
-                // but our logic in WndProc handles "no change" by just re-saving the same data 
-                // (since we only write to result_service on OK). 
-                // However, for ADD, we need to ensure it's empty if cancelled?
-                // Actually, for ADD, result_service starts empty.
-                // For EDIT, it starts with data.
-                // If we Cancel, we shouldn't trigger the "save" logic in WndProc.
-                // Let's use a flag or clear the name on cancel to be sure.
                 g_dialogData.result_service.name = ""; 
                 DestroyWindow(hwnd);
             } else if (id == ID_BTN_BROWSE_SCRIPT || id == ID_BTN_BROWSE_PYTHON || id == ID_BTN_BROWSE_WORKDIR) {
@@ -899,6 +1082,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ofn.hwndOwner = hwnd;
                 ofn.lpstrFile = szFile;
                 ofn.nMaxFile = sizeof(szFile);
+
                 ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
 
                 if (id == ID_BTN_BROWSE_WORKDIR) {
@@ -1233,11 +1417,14 @@ void UpdateListView() {
         std::wstring wHideConsole = s.hide_console ? L"是" : L"否";
         ListView_SetItemText(hListView, i, 5, (LPWSTR)wHideConsole.c_str());
 
+        std::wstring wAutoRestart = s.auto_restart ? L"是" : L"否";
+        ListView_SetItemText(hListView, i, 6, (LPWSTR)wAutoRestart.c_str());
+
         std::wstring wRuntime = Utf8ToWide(s.get_runtime());
-        ListView_SetItemText(hListView, i, 6, (LPWSTR)wRuntime.c_str());
+        ListView_SetItemText(hListView, i, 7, (LPWSTR)wRuntime.c_str());
 
         std::wstring wPorts = Utf8ToWide(s.ports);
-        ListView_SetItemText(hListView, i, 7, (LPWSTR)wPorts.c_str());
+        ListView_SetItemText(hListView, i, 8, (LPWSTR)wPorts.c_str());
     }
 }
 
@@ -1426,10 +1613,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             EnableModernWindow(hwnd);
             InitTrayIcon(hwnd);
 
-            // Create ListView
+            // ListView height reduced to 240 to show ~10 rows
             hListView = CreateWindowExW(0, WC_LISTVIEWW, L"", 
                 WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                10, 10, 760, 400, hwnd, (HMENU)ID_LISTVIEW, hInst, NULL);
+                10, 10, 760, 240, hwnd, (HMENU)ID_LISTVIEW, hInst, NULL);
             
             ListView_SetExtendedListViewStyle(hListView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
             SetWindowTheme(hListView, L"Explorer", NULL);
@@ -1445,10 +1632,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             lvc.cx = 50; lvc.pszText = (LPWSTR)L"状态"; ListView_InsertColumn(hListView, 1, &lvc);
             lvc.cx = 48;  lvc.pszText = (LPWSTR)L"PID"; ListView_InsertColumn(hListView, 2, &lvc);
             lvc.cx = 70; lvc.pszText = (LPWSTR)L"类型"; ListView_InsertColumn(hListView, 3, &lvc);
-            lvc.cx = 80;  lvc.pszText = (LPWSTR)L"自启动"; ListView_InsertColumn(hListView, 4, &lvc);
-            lvc.cx = 80;  lvc.pszText = (LPWSTR)L"隐藏控制台"; ListView_InsertColumn(hListView, 5, &lvc);
-            lvc.cx = 60; lvc.pszText = (LPWSTR)L"运行时间"; ListView_InsertColumn(hListView, 6, &lvc);
-            lvc.cx = 225; lvc.pszText = (LPWSTR)L"端口"; ListView_InsertColumn(hListView, 7, &lvc);
+            
+            lvc.fmt = LVCFMT_CENTER;
+            lvc.cx = 48;  lvc.pszText = (LPWSTR)L"自启动"; ListView_InsertColumn(hListView, 4, &lvc);
+            lvc.cx = 48;  lvc.pszText = (LPWSTR)L"隐藏"; ListView_InsertColumn(hListView, 5, &lvc);
+            lvc.cx = 48;  lvc.pszText = (LPWSTR)L"重启"; ListView_InsertColumn(hListView, 6, &lvc);
+            
+            lvc.fmt = LVCFMT_LEFT;
+            lvc.cx = 60; lvc.pszText = (LPWSTR)L"运行时间"; ListView_InsertColumn(hListView, 7, &lvc);
+            lvc.cx = 225; lvc.pszText = (LPWSTR)L"系统TCP端口"; ListView_InsertColumn(hListView, 8, &lvc);
+
+            // Create Log Edit Control (lower section)
+            hLogEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+                10, 260, 760, 150, hwnd, (HMENU)ID_EDIT_LOG, hInst, NULL);
+            SendMessage(hLogEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // Create Buttons
             int btnY = 420;
@@ -1489,10 +1686,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_manager.load_config();
             
             // Auto-start services
-            for (size_t i = 0; i < g_manager.services.size(); ++i) {
-                if (g_manager.services[i].auto_start) {
-                    g_manager.start_service(i);
+            std::vector<std::string> autoStartServices;
+            for (const auto& svc : g_manager.services) {
+                if (svc.auto_start) {
+                    autoStartServices.push_back(svc.name);
                 }
+            }
+            
+            if (!autoStartServices.empty()) {
+                std::thread(StartupThreadFunc, hwnd, autoStartServices, g_manager.startup_interval).detach();
             }
             
             UpdateListView();
@@ -1508,6 +1710,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             return DefWindowProc(hwnd, msg, wParam, lParam);
+        case WM_REQ_START_FROM_QUEUE: {
+            std::string name;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingMutex);
+                if (!g_pendingStarts.empty()) {
+                    name = g_pendingStarts.front();
+                    g_pendingStarts.pop_front();
+                }
+            }
+            
+            if (!name.empty()) {
+                int idx = g_manager.get_service_index(name);
+                if (idx != -1) {
+                    g_manager.start_service(idx);
+                    UpdateListView();
+                }
+            }
+            break;
+        }
         case WM_TRAYICON:
             if (lParam == WM_RBUTTONUP) {
                 POINT pt;
@@ -1539,12 +1760,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     std::wstring wRuntime = Utf8ToWide(s.get_runtime());
                     std::wstring wPorts = Utf8ToWide(s.ports);
                     
-                    // Check if changed before setting to reduce flicker? 
-                    // ListView_SetItemText is relatively cheap.
-                    ListView_SetItemText(hListView, i, 1, (LPWSTR)wStatus.c_str());
-                    ListView_SetItemText(hListView, i, 2, (LPWSTR)wPid.c_str());
-                    ListView_SetItemText(hListView, i, 6, (LPWSTR)wRuntime.c_str());
-                    ListView_SetItemText(hListView, i, 7, (LPWSTR)wPorts.c_str());
+                    // Helper lambda to check and update
+                    auto updateIfChanged = [&](int col, const std::wstring& newVal) {
+                        wchar_t buf[256];
+                        ListView_GetItemText(hListView, i, col, buf, 256);
+                        if (newVal != buf) {
+                            ListView_SetItemText(hListView, i, col, (LPWSTR)newVal.c_str());
+                        }
+                    };
+
+                    updateIfChanged(1, wStatus);
+                    updateIfChanged(2, wPid);
+                    updateIfChanged(7, wRuntime);
+                    updateIfChanged(8, wPorts);
                 }
             }
             break;
@@ -1579,12 +1807,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             return CDRF_NEWFONT;
                         }
                     } else {
-                        if ((cd->nmcd.dwItemSpec % 2) == 1) {
-                            cd->clrTextBk = isHighContrast ? GetSysColor(COLOR_WINDOW) : RGB(245,245,245);
-                        } else {
-                            cd->clrTextBk = isHighContrast ? GetSysColor(COLOR_WINDOW) : RGB(255,255,255);
-                        }
-                        cd->clrText = isHighContrast ? GetSysColor(COLOR_WINDOWTEXT) : RGB(32,32,32);
+                        // Uniform white background and black text
+                        cd->clrTextBk = isHighContrast ? GetSysColor(COLOR_WINDOW) : RGB(255, 255, 255);
+                        cd->clrText = isHighContrast ? GetSysColor(COLOR_WINDOWTEXT) : RGB(0, 0, 0);
                         return CDRF_NEWFONT;
                     }
                     break;
@@ -1610,6 +1835,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
                     AppendMenuW(hMenu, MF_STRING, ID_MENU_EDIT, L"编辑");
                     AppendMenuW(hMenu, MF_STRING, ID_MENU_DEL, L"删除");
+                    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+                    AppendMenuW(hMenu, MF_STRING | (lpnmitem->iItem == 0 ? MF_GRAYED : 0), ID_MENU_MOVE_UP, L"上移");
+                    AppendMenuW(hMenu, MF_STRING | (lpnmitem->iItem == g_manager.services.size() - 1 ? MF_GRAYED : 0), ID_MENU_MOVE_DOWN, L"下移");
                     
                     POINT pt;
                     GetCursorPos(&pt);
@@ -1651,6 +1879,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             s.work_dir = g_dialogData.result_service.work_dir;
                             s.auto_start = g_dialogData.result_service.auto_start;
                             s.hide_console = g_dialogData.result_service.hide_console;
+                            s.auto_restart = g_dialogData.result_service.auto_restart;
                             
                             g_manager.save_config();
                             UpdateListView();
@@ -1691,10 +1920,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     break;
                 }
-                case ID_BTN_STARTALL:
-                    for (size_t i = 0; i < g_manager.services.size(); ++i) g_manager.start_service(i);
+                case ID_BTN_STARTALL: {
+                    std::vector<std::string> allServices;
+                    for (const auto& svc : g_manager.services) {
+                        allServices.push_back(svc.name);
+                    }
+                    if (!allServices.empty()) {
+                        std::thread(StartupThreadFunc, hwnd, allServices, g_manager.startup_interval).detach();
+                    }
                     UpdateListView();
                     break;
+                }
                 case ID_BTN_STOPALL:
                     for (size_t i = 0; i < g_manager.services.size(); ++i) g_manager.stop_service(i);
                     UpdateListView();
@@ -1733,6 +1969,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_MENU_SYS_RESTART:
                     RestartSystemService();
                     break;
+                case ID_MENU_MOVE_UP: {
+                    int sel = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
+                    if (sel > 0) {
+                        std::swap(g_manager.services[sel], g_manager.services[sel - 1]);
+                        g_manager.save_config();
+                        UpdateListView();
+                        // Restore selection
+                        ListView_SetItemState(hListView, sel - 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                        ListView_EnsureVisible(hListView, sel - 1, FALSE);
+                    }
+                    break;
+                }
+                case ID_MENU_MOVE_DOWN: {
+                    int sel = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
+                    if (sel != -1 && sel < g_manager.services.size() - 1) {
+                        std::swap(g_manager.services[sel], g_manager.services[sel + 1]);
+                        g_manager.save_config();
+                        UpdateListView();
+                        // Restore selection
+                        ListView_SetItemState(hListView, sel + 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                        ListView_EnsureVisible(hListView, sel + 1, FALSE);
+                    }
+                    break;
+                }
                 case ID_MENU_START:
                     SendMessage(hwnd, WM_COMMAND, ID_BTN_START, 0);
                     break;
